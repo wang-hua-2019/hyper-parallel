@@ -226,6 +226,77 @@ def test_fsdp_reduce_grad_launches_after_overlap_b_f_on_caller() -> None:
     card_mark="onecard",
     essential_mark="essential",
 )
+def test_fsdp_reduce_grad_defers_past_final_bwd_send() -> None:
+    """A trailing final grad send should launch before the HSDP collectives."""
+    last_micro = 3
+    actions = [
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD, 8),
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD_SEND, 8),
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD, 0),
+    ]
+
+    result = scheduler_module.add_fsdp_reduce_grad(
+        actions,
+        managed_stage_indices={0, 8},
+        micro_batch_num=last_micro + 1,
+    )
+
+    assert [
+        None if step is None else step.type
+        for step in result
+    ] == [
+        scheduler_module.MetaStepType.BWD,
+        scheduler_module.MetaStepType.BWD_SEND,
+        scheduler_module.MetaStepType.FSDP_REDUCE_GRAD,
+        scheduler_module.MetaStepType.BWD,
+        scheduler_module.MetaStepType.FSDP_REDUCE_GRAD,
+        scheduler_module.MetaStepType.FSDP_WAIT_REDUCE_GRAD,
+    ]
+    assert [
+        None if step is None else step.stage_index
+        for step in result
+    ] == [8, 8, 8, 0, 0, 0]
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
+def test_fsdp_reduce_grad_dxdw_send_before_weight_keeps_after_weight() -> None:
+    """A dxdw-split send ahead of BWD_WEIGHT must not lose or hoist its reduce."""
+    last_micro = 3
+    actions = [
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD_INPUT, 8),
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD_SEND, 8),
+        scheduler_module.MetaStep(last_micro, scheduler_module.MetaStepType.BWD_WEIGHT, 8),
+    ]
+
+    result = scheduler_module.add_fsdp_reduce_grad(
+        actions,
+        managed_stage_indices={8},
+        micro_batch_num=last_micro + 1,
+    )
+
+    assert [
+        None if step is None else step.type
+        for step in result
+    ] == [
+        scheduler_module.MetaStepType.BWD_INPUT,
+        scheduler_module.MetaStepType.BWD_SEND,
+        scheduler_module.MetaStepType.BWD_WEIGHT,
+        scheduler_module.MetaStepType.FSDP_REDUCE_GRAD,
+        scheduler_module.MetaStepType.FSDP_WAIT_REDUCE_GRAD,
+    ]
+
+
+@arg_mark(
+    plat_marks=["cpu_linux"],
+    level_mark="level0",
+    card_mark="onecard",
+    essential_mark="essential",
+)
 def test_fsdp_control_handlers_launch_and_wait_on_caller_thread() -> None:
     """FSDP control actions should launch and drain backend work."""
     stage = SimpleNamespace(

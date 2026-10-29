@@ -2486,25 +2486,68 @@ def add_fsdp_unshard_reshard(actions, managed_stage_indices, max_active_stages=3
 
 
 def add_fsdp_reduce_grad(actions, managed_stage_indices, micro_batch_num):
-    """Launch reduction after each final backward and drain after all local stages."""
+    """Launch reduction after each final backward and drain after all local stages.
+
+    The launch point defers past the stage's final ``BWD_SEND`` when that send
+    executes after the final backward (e.g. the 1F1B cooldown tail):
+    ``launch_reduce_grad`` issues every HSDP module's reduce-scatter / fused
+    all-reduce on the caller thread, so a launch placed between the final
+    ``BWD`` and its ``BWD_SEND`` makes the downstream stage's drain wait one
+    reduce-launch's dispatch latency per boundary. The input-grad send and the
+    weight-grad reduction touch disjoint tensors, so sending first is safe.
+    Schedules without a trailing ``BWD_SEND`` (first stage, dxdw-split orders
+    that send before ``BWD_WEIGHT``) keep the inject-right-after-backward
+    placement.
+    """
     if not managed_stage_indices:
+        return actions
+
+    last_micro = micro_batch_num - 1
+    # Per managed stage: action index AFTER which its FSDP_REDUCE_GRAD is
+    # inserted — one past the action holding the last of the stage's final
+    # backward (BWD / BWD_WEIGHT) and final grad send (BWD_SEND). BWD_SEND
+    # only extends an existing reduce point (never creates one): a send
+    # without a matching backward leaf would otherwise gain a reduce the old
+    # placement did not issue.
+    reduce_points = {}
+    stage_order = []
+    for action_index, action in enumerate(actions):
+        for leaf_step in iter_leaf_meta_steps(action):
+            if leaf_step.stage_index not in managed_stage_indices:
+                continue
+            if leaf_step.micro_index != last_micro:
+                continue
+            is_backward_leaf = leaf_step.type in (
+                MetaStepType.BWD,
+                MetaStepType.BWD_WEIGHT,
+            )
+            is_grad_send_leaf = leaf_step.type == MetaStepType.BWD_SEND
+            if not (is_backward_leaf or is_grad_send_leaf):
+                continue
+            stage_index = leaf_step.stage_index
+            if stage_index not in reduce_points:
+                if not is_backward_leaf:
+                    # A lone final BWD_SEND cannot create a reduce point —
+                    # its backward leaf either already registered one or is
+                    # still ahead of it in the scan.
+                    continue
+                stage_order.append(stage_index)
+                reduce_points[stage_index] = action_index + 1
+            else:
+                reduce_points[stage_index] = max(
+                    reduce_points[stage_index], action_index + 1
+                )
+
+    if not reduce_points:
         return actions
 
     fsdp_actions = []
     last_reduced_stage_index = None
-    for action in actions:
+    for action_index, action in enumerate(actions):
         fsdp_actions.append(action)
-        reduced_stage_indices = []
-        for leaf_step in iter_leaf_meta_steps(action):
-            if leaf_step.stage_index not in managed_stage_indices:
+        for stage_index in stage_order:
+            if reduce_points.get(stage_index) != action_index + 1:
                 continue
-            if leaf_step.type not in (MetaStepType.BWD, MetaStepType.BWD_WEIGHT):
-                continue
-            if leaf_step.micro_index != micro_batch_num - 1:
-                continue
-            if leaf_step.stage_index not in reduced_stage_indices:
-                reduced_stage_indices.append(leaf_step.stage_index)
-        for stage_index in reduced_stage_indices:
             fsdp_actions.append(
                 MetaStep(None, MetaStepType.FSDP_REDUCE_GRAD, stage_index)
             )
